@@ -258,7 +258,7 @@ with tab_dashboard:
             })
 
         df_absorcion = pd.DataFrame(absorcion_data).sort_values("Absorcion %", ascending=False)
-        st.bar_chart(df_absorcion.set_index("Proyecto")["Absorcion %"], horizontal=True)
+        st.bar_chart(df_absorcion.set_index("Proyecto")["Absorcion %"])
 
         # --- Historial si hay multiples fechas ---
         fechas_unicas = sorted(df_inventario["fecha_revision"].unique())

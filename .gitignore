@@ -1,0 +1,15 @@
+# Entorno virtual de Python
+venv/
+
+# PDFs descargados (se descargan con gdown)
+pdfs/
+
+# Configuracion local
+config.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

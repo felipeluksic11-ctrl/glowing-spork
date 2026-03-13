@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SOS Alert - iPhone Simulator</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="simulator-container">
+        <h1 class="simulator-title">SOS Alert</h1>
+        <p class="simulator-subtitle">Boton de emergencia con transmision en vivo</p>
+
+        <div class="iphone-frame">
+            <div class="iphone-notch"></div>
+            <div class="iphone-screen" id="screen">
+                <!-- Dynamic content injected by JS -->
+            </div>
+            <div class="iphone-home-indicator"></div>
+        </div>
+
+        <div class="controls">
+            <button class="control-btn" onclick="app.reset()">Reiniciar</button>
+            <div class="version-badge">v2.0</div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

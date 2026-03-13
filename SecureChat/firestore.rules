@@ -1,0 +1,47 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Users: anyone authenticated can read, only owner can write
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth.uid == userId;
+      allow update: if request.auth.uid == userId;
+      allow delete: if false;
+    }
+
+    // Contacts: only the owner can read/write their contacts
+    match /contacts/{userId}/userContacts/{contactId} {
+      allow read, write: if request.auth.uid == userId;
+    }
+
+    // Conversations: only participants can read/write
+    match /conversations/{convId} {
+      allow read: if request.auth != null
+                  && request.auth.uid in resource.data.participants;
+      allow create: if request.auth != null
+                    && request.auth.uid in request.resource.data.participants;
+      allow update: if request.auth != null
+                    && request.auth.uid in resource.data.participants;
+      allow delete: if false;
+
+      // Messages: only participants can read, only sender can create
+      match /messages/{msgId} {
+        allow read: if request.auth != null
+                    && request.auth.uid in get(/databases/$(database)/documents/conversations/$(convId)).data.participants;
+        allow create: if request.auth != null
+                      && request.auth.uid in get(/databases/$(database)/documents/conversations/$(convId)).data.participants
+                      && request.auth.uid == request.resource.data.senderId;
+        allow update, delete: if false;
+      }
+
+      // Locations: only participants can read, only own location can be written
+      match /locations/{userId} {
+        allow read: if request.auth != null
+                    && request.auth.uid in get(/databases/$(database)/documents/conversations/$(convId)).data.participants;
+        allow write: if request.auth.uid == userId
+                     && request.auth.uid in get(/databases/$(database)/documents/conversations/$(convId)).data.participants;
+      }
+    }
+  }
+}

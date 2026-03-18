@@ -1,0 +1,52 @@
+name: Scrape Rental Listings
+
+on:
+  schedule:
+    # Every Monday at 5 AM CST (11 AM UTC)
+    - cron: '0 11 * * 1'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 pandas scikit-learn numpy-financial joblib
+
+      - name: Run rental scraper
+        env:
+          PROPYTE_API_URL: ${{ secrets.PROPYTE_API_URL }}
+          RENTAL_SCRAPER_API_KEY: ${{ secrets.RENTAL_SCRAPER_API_KEY }}
+        run: python scraper_rentals.py
+
+      - name: Run rental analyst (ML estimates)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python analista_rentas.py
+
+      - name: Upload CSV artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rental-comparables-${{ github.run_number }}
+          path: outputs/rental_comparables.csv
+          retention-days: 30
+
+      - name: Upload model artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rental-model-${{ github.run_number }}
+          path: outputs/rental_model.pkl
+          retention-days: 30

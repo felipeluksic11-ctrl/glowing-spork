@@ -249,6 +249,130 @@ def fetch_rental_data() -> pd.DataFrame:
     return df
 
 
+# ================================================================
+# DATA CLEANING — Statistical outlier removal & quality filters
+# ================================================================
+
+# Absolute bounds (anything outside is clearly wrong data)
+RENT_ABS_MIN = 2_000        # No legitimate monthly rent below $2K MXN
+RENT_ABS_MAX = 500_000      # Above $500K is likely a sale price, not rent
+AREA_ABS_MIN = 15           # Below 15m² is likely missing/default value
+AREA_ABS_MAX = 800          # Above 800m² for a rental is likely total lot size
+RENT_PER_M2_ABS_MIN = 20    # Below $20/m² is either wrong area or wrong rent
+RENT_PER_M2_ABS_MAX = 2_000 # Above $2K/m² is likely wrong (even luxury Cancun peaks ~$600)
+BEDROOMS_MAX = 10            # Above 10br is likely a data entry error
+
+# Statistical cleaning config
+IQR_MULTIPLIER = 2.5         # Tukey fence multiplier for zone-level outlier removal
+
+
+def clean_rental_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Multi-stage data cleaning pipeline.
+    Removes dirty data that distorts rent/m² predictions.
+    Returns cleaned DataFrame + prints diagnostic report.
+    """
+    n_start = len(df)
+    removed_reasons: dict[str, int] = {}
+
+    def _remove(mask, reason):
+        nonlocal df
+        # Align mask to df index to avoid reindex warning
+        aligned = mask.reindex(df.index, fill_value=False)
+        n = aligned.sum()
+        if n > 0:
+            removed_reasons[reason] = n
+        return df[~aligned].copy()
+
+    print("[1.5/9] Cleaning rental data...")
+
+    # Ensure numeric types
+    for col in ["monthly_rent_mxn", "area_m2", "bedrooms", "bathrooms"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Stage 1: Absolute rent bounds
+    mask = df["monthly_rent_mxn"].isna() | (df["monthly_rent_mxn"] < RENT_ABS_MIN)
+    df = _remove(mask, f"rent < ${RENT_ABS_MIN:,}")
+
+    mask = df["monthly_rent_mxn"] > RENT_ABS_MAX
+    df = _remove(mask, f"rent > ${RENT_ABS_MAX:,} (likely sale price)")
+
+    # Stage 2: Area bounds (only filter rows that HAVE area, don't discard missing)
+    has_area = df["area_m2"].notna() & (df["area_m2"] > 0)
+
+    mask = has_area & (df["area_m2"] < AREA_ABS_MIN)
+    df = _remove(mask, f"area < {AREA_ABS_MIN}m² (likely default/missing)")
+
+    mask = has_area & (df["area_m2"] > AREA_ABS_MAX)
+    df = _remove(mask, f"area > {AREA_ABS_MAX}m² (likely lot size, not built)")
+
+    # Stage 3: Rent/m² absolute bounds (only for rows with valid area)
+    has_area = df["area_m2"].notna() & (df["area_m2"] >= AREA_ABS_MIN)
+    df.loc[has_area, "_rent_per_m2"] = df.loc[has_area, "monthly_rent_mxn"] / df.loc[has_area, "area_m2"]
+
+    mask = has_area & (df["_rent_per_m2"] < RENT_PER_M2_ABS_MIN)
+    df = _remove(mask, f"rent/m² < ${RENT_PER_M2_ABS_MIN} (suspiciously low)")
+
+    mask = has_area & (df["_rent_per_m2"] > RENT_PER_M2_ABS_MAX)
+    df = _remove(mask, f"rent/m² > ${RENT_PER_M2_ABS_MAX:,} (suspiciously high)")
+
+    # Stage 4: Bedroom sanity
+    mask = df["bedrooms"].notna() & (df["bedrooms"] > BEDROOMS_MAX)
+    df = _remove(mask, f"bedrooms > {BEDROOMS_MAX}")
+
+    # Stage 5: Zone-level IQR outlier removal (Tukey fences within each city+zone)
+    n_before_iqr = len(df)
+    if "zone" in df.columns and "city" in df.columns:
+        keep_mask = pd.Series(True, index=df.index)
+        for (city, zone), grp in df.groupby(["city", "zone"]):
+            if len(grp) < 5:
+                continue  # Not enough data for statistical filtering
+            q1 = grp["monthly_rent_mxn"].quantile(0.25)
+            q3 = grp["monthly_rent_mxn"].quantile(0.75)
+            iqr = q3 - q1
+            if iqr == 0:
+                continue
+            lower = q1 - IQR_MULTIPLIER * iqr
+            upper = q3 + IQR_MULTIPLIER * iqr
+            zone_outliers = (grp["monthly_rent_mxn"] < lower) | (grp["monthly_rent_mxn"] > upper)
+            keep_mask.loc[grp.index[zone_outliers]] = False
+
+        n_iqr_removed = (~keep_mask).sum()
+        if n_iqr_removed > 0:
+            removed_reasons[f"zone-level IQR outlier ({IQR_MULTIPLIER}×)"] = n_iqr_removed
+            df = df[keep_mask].copy()
+
+    # Stage 6: Deduplicate (same rent + same area + same zone + same rental_type = likely same listing)
+    n_before_dedup = len(df)
+    dedup_cols = ["city", "zone", "monthly_rent_mxn", "area_m2", "bedrooms", "property_type", "rental_type"]
+    existing_cols = [c for c in dedup_cols if c in df.columns]
+    df = df.drop_duplicates(subset=existing_cols, keep="first")
+    n_dedup = n_before_dedup - len(df)
+    if n_dedup > 0:
+        removed_reasons["cross-portal duplicates"] = n_dedup
+
+    # Cleanup temp columns
+    if "_rent_per_m2" in df.columns:
+        df = df.drop(columns=["_rent_per_m2"])
+
+    # Report
+    n_end = len(df)
+    n_removed = n_start - n_end
+    print(f"  Cleaning report: {n_start:,} → {n_end:,} ({n_removed:,} removed, {n_removed/n_start*100:.1f}%)")
+    for reason, count in sorted(removed_reasons.items(), key=lambda x: -x[1]):
+        print(f"    - {reason}: {count:,}")
+
+    # Post-cleaning quality check
+    has_area_clean = df[df["area_m2"].notna() & (df["area_m2"] >= AREA_ABS_MIN)]
+    if len(has_area_clean) > 0:
+        rpm2 = has_area_clean["monthly_rent_mxn"] / has_area_clean["area_m2"]
+        print(f"  Post-clean rent/m²: median=${rpm2.median():,.0f}, mean=${rpm2.mean():,.0f}, "
+              f"mean/median={rpm2.mean()/rpm2.median():.2f}x")
+
+    return df
+
+
 def fetch_developments() -> pd.DataFrame:
     """Fetch published developments from Supabase."""
     print("[6/9] Fetching developments from Supabase...")
@@ -608,7 +732,7 @@ def _compute_financials(
         "irr_10yr": irr_10yr,
         "cash_on_cash_pct": cash_on_cash,
         "breakeven_months": breakeven,
-        "monthly_net_flow": int(monthly_net_flow),
+        "monthly_net_flow": int(monthly_net_flow) if not math.isnan(monthly_net_flow) else 0,
         "cap_rate": cap_rate,
         "rent_yield_gross": rent_yield_gross,
         "rent_yield_net": rent_yield_net,
@@ -846,6 +970,12 @@ def main():
     df = fetch_rental_data()
     if df.empty or len(df) < 50:
         print("ERROR: Not enough rental data to train model")
+        sys.exit(1)
+
+    # 1.5. Clean data (remove outliers, duplicates, invalid entries)
+    df = clean_rental_data(df)
+    if len(df) < 50:
+        print("ERROR: Not enough data after cleaning")
         sys.exit(1)
 
     # 2. Preprocess (splits into res/vac)

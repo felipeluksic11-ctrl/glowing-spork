@@ -66,6 +66,19 @@ CITY_TO_MARKET = {
     "Bacalar": "bacalar",
 }
 
+# AirDNA market prefix → city mapping (for multi-market cities)
+# Some cities have multiple AirDNA markets (e.g. playa_del_carmen, playa_del_carmen_playacar)
+MARKET_PREFIX_TO_CITY = {
+    "cancun": "Cancun",
+    "playa_del_carmen": "Playa del Carmen",
+    "tulum": "Tulum",
+    "bacalar": "Bacalar",
+    "mahahual": "Mahahual",
+    "merida": "Merida",
+    "puerto_morelos": "Puerto Morelos",
+    "cozumel": "Cozumel",
+}
+
 
 def normalize_min_max(values: pd.Series) -> pd.Series:
     """Normalize values to 0-100 scale using min-max."""
@@ -190,54 +203,149 @@ def fetch_dev_zones() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def compute_zone_scores(city: str, market: str) -> list[dict]:
-    """Compute Zone Intelligence Scores for all zones in a city/market."""
-    print(f"\n  Computing zone scores for {city} (market: {market})...")
+def discover_markets() -> dict[str, list[str]]:
+    """Discover all AirDNA markets from the DB and group by city."""
+    rows = supabase_fetch(
+        "airdna_metrics",
+        select="market",
+        filters="limit=5000",
+    )
+    if not rows:
+        return {}
 
-    # Fetch all data sources
-    occ_df = fetch_airdna_occupancy(market)
-    adr_df = fetch_airdna_adr(market)
-    listings_df = fetch_airdna_listings(market)
+    # Get unique markets
+    markets = list({r["market"] for r in rows if r.get("market")})
+
+    # Group markets by city using prefix matching
+    city_markets: dict[str, list[str]] = {}
+    for market in sorted(markets):
+        # Find city by matching prefix
+        matched_city = None
+        for prefix, city in sorted(MARKET_PREFIX_TO_CITY.items(), key=lambda x: -len(x[0])):
+            if market == prefix or market.startswith(prefix + "_"):
+                matched_city = city
+                break
+        if not matched_city:
+            matched_city = market.replace("_", " ").title()
+
+        if matched_city not in city_markets:
+            city_markets[matched_city] = []
+        city_markets[matched_city].append(market)
+
+    return city_markets
+
+
+def compute_zone_scores(city: str, markets: list[str]) -> list[dict]:
+    """Compute Zone Intelligence Scores for all zones in a city across all its AirDNA markets."""
+    print(f"\n  Computing zone scores for {city} (markets: {', '.join(markets)})...")
+
+    # Fetch AirDNA data across ALL markets for this city
+    occ_dfs, adr_dfs, listings_dfs = [], [], []
+    for market in markets:
+        occ = fetch_airdna_occupancy(market)
+        if not occ.empty:
+            occ["_market"] = market
+            occ_dfs.append(occ)
+        adr = fetch_airdna_adr(market)
+        if not adr.empty:
+            adr["_market"] = market
+            adr_dfs.append(adr)
+        lst = fetch_airdna_listings(market)
+        if not lst.empty:
+            lst["_market"] = market
+            listings_dfs.append(lst)
+
+    occ_df = pd.concat(occ_dfs) if occ_dfs else pd.DataFrame()
+    adr_df = pd.concat(adr_dfs) if adr_dfs else pd.DataFrame()
+    listings_df = pd.concat(listings_dfs) if listings_dfs else pd.DataFrame()
+
+    # Also fetch market-level data (submarket=null) for markets that are themselves zones
+    for market in markets:
+        # Fetch market-level occupancy
+        market_occ = supabase_fetch(
+            "airdna_metrics",
+            select="metric_value,metric_date",
+            filters=f"market=eq.{market}&section=eq.occupancy&chart=eq.chart_1"
+                    f"&metric_name=eq.occupancy&submarket=is.null"
+                    f"&order=metric_date.desc&limit=1",
+        )
+        market_adr = supabase_fetch(
+            "airdna_metrics",
+            select="metric_value,metric_date",
+            filters=f"market=eq.{market}&section=eq.rates&chart=eq.chart_1"
+                    f"&metric_name=eq.daily_rate&submarket=is.null"
+                    f"&order=metric_date.desc&limit=2",
+        )
+        if market_occ or market_adr:
+            # Use market name as a zone if it's a sub-market of a city
+            zone_name = market.replace("_", " ").title()
+            # Clean up: "Playa Del Carmen Playacar" → "Playacar"
+            for prefix_city in MARKET_PREFIX_TO_CITY.values():
+                prefix_lower = prefix_city.lower().replace(" ", "_")
+                if market.startswith(prefix_lower + "_"):
+                    suffix = market[len(prefix_lower) + 1:]
+                    zone_name = suffix.replace("_", " ").title()
+                    break
+
+            if market in MARKET_PREFIX_TO_CITY.values() or market in [v for vs in CITY_TO_MARKET.values() for v in [vs]]:
+                zone_name = "Market General"
+
+            # Skip if already covered by submarckets
+            if not occ_df.empty and market in occ_df.get("_market", pd.Series()).values:
+                continue
+
     rental_df = fetch_rental_medians(city)
     fin_df = fetch_development_financials()
     dev_df = fetch_dev_zones()
 
-    if occ_df.empty and adr_df.empty:
-        print(f"    No AirDNA data for {market}, skipping")
+    if occ_df.empty and adr_df.empty and rental_df.empty:
+        print(f"    No data for {city}, skipping")
         return []
 
     # Build zone-level metrics from submarket data
     zone_metrics = {}
 
     # Map submarket → zone and aggregate
-    for _, row in occ_df.iterrows():
-        sub = row["submarket"]
-        zone = SUBMARKET_TO_ZONE.get(sub, sub.upper())
-        if zone not in zone_metrics:
-            zone_metrics[zone] = {"submarket": sub}
-        zone_metrics[zone]["occupancy"] = row["occupancy"]
+    if not occ_df.empty:
+        for _, row in occ_df.iterrows():
+            sub = row["submarket"]
+            market = row.get("_market", "")
+            zone = SUBMARKET_TO_ZONE.get(sub, sub.upper() if sub else market.replace("_", " ").title())
+            if zone not in zone_metrics:
+                zone_metrics[zone] = {"submarket": sub}
+            zone_metrics[zone]["occupancy"] = row["occupancy"]
 
-    for _, row in adr_df.iterrows():
-        sub = row["submarket"]
-        zone = SUBMARKET_TO_ZONE.get(sub, sub.upper())
-        if zone not in zone_metrics:
-            zone_metrics[zone] = {"submarket": sub}
-        zone_metrics[zone]["adr"] = row["adr"]
-        zone_metrics[zone]["adr_growth_pct"] = row["adr_growth_pct"]
+    if not adr_df.empty:
+        for _, row in adr_df.iterrows():
+            sub = row["submarket"]
+            zone = SUBMARKET_TO_ZONE.get(sub, sub.upper() if sub else row.get("_market", "").replace("_", " ").title())
+            if zone not in zone_metrics:
+                zone_metrics[zone] = {"submarket": sub}
+            zone_metrics[zone]["adr"] = row["adr"]
+            zone_metrics[zone]["adr_growth_pct"] = row["adr_growth_pct"]
 
-    for _, row in listings_df.iterrows():
-        sub = row["submarket"]
-        zone = SUBMARKET_TO_ZONE.get(sub, sub.upper())
-        if zone not in zone_metrics:
-            zone_metrics[zone] = {"submarket": sub}
-        zone_metrics[zone]["active_listings"] = row["active_listings"]
+    if not listings_df.empty:
+        for _, row in listings_df.iterrows():
+            sub = row["submarket"]
+            zone = SUBMARKET_TO_ZONE.get(sub, sub.upper() if sub else row.get("_market", "").replace("_", " ").title())
+            if zone not in zone_metrics:
+                zone_metrics[zone] = {"submarket": sub}
+            zone_metrics[zone]["active_listings"] = row["active_listings"]
 
-    # Add rental medians
-    for _, row in rental_df.iterrows():
-        zone = row["zone"]
-        if zone in zone_metrics:
+    # Add zones from rental comparables that don't have AirDNA data
+    if not rental_df.empty:
+        for _, row in rental_df.iterrows():
+            zone = row["zone"]
+            if zone not in zone_metrics:
+                zone_metrics[zone] = {}
             zone_metrics[zone]["median_rent"] = row["median_rent"]
             zone_metrics[zone]["sample_size"] = row["sample_size"]
+        # Also add to existing zones
+        for _, row in rental_df.iterrows():
+            zone = row["zone"]
+            if zone in zone_metrics and "median_rent" not in zone_metrics[zone]:
+                zone_metrics[zone]["median_rent"] = row["median_rent"]
+                zone_metrics[zone]["sample_size"] = row["sample_size"]
 
     # Add yield from development financials
     if not dev_df.empty and not fin_df.empty:
@@ -373,9 +481,29 @@ def main():
         print("ERROR: Supabase credentials not configured")
         sys.exit(1)
 
+    # Auto-discover all markets from the DB
+    city_markets = discover_markets()
+    print(f"\nDiscovered {len(city_markets)} cities with AirDNA data:")
+    for city, markets in city_markets.items():
+        print(f"  {city}: {', '.join(markets)}")
+
+    # Also add cities that only have rental comparables
+    rental_cities = supabase_fetch(
+        "rental_comparables",
+        select="city",
+        filters="active=eq.true&limit=50000",
+    )
+    if rental_cities:
+        rental_city_set = {r["city"] for r in rental_cities if r.get("city")}
+        for rc in rental_city_set:
+            if rc not in city_markets:
+                city_markets[rc] = []
+
+    print(f"\nTotal cities (AirDNA + rental comparables): {len(city_markets)}")
+
     all_scores = []
-    for city, market in CITY_TO_MARKET.items():
-        scores = compute_zone_scores(city, market)
+    for city, markets in sorted(city_markets.items()):
+        scores = compute_zone_scores(city, markets)
         all_scores.extend(scores)
 
     if all_scores:
